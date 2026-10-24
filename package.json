@@ -1,0 +1,38 @@
+{
+  "name": "forge-llm",
+  "version": "1.0.0",
+  "description": "FORGE · Verifiable AI Kernel — 零依赖纯 JavaScript 的 LLaMA/GGUF 训练·量化·推理内核，内置数学不变量自检",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": { "forge": "cli/forge.mjs" },
+  "exports": {
+    ".": "./src/index.js",
+    "./L0": "./src/L0/numeric.js",
+    "./L1": "./src/L1/special.js",
+    "./L2": "./src/L2/autograd.js",
+    "./L3": "./src/L3/quant.js",
+    "./L4": "./src/L4/nn.js",
+    "./L5": "./src/L5/attention.js",
+    "./L6": "./src/L6/transformer.js",
+    "./L7": "./src/L7/tokenizer.js",
+    "./L8": "./src/L8/sampling.js",
+    "./L9": "./src/L9/gguf.js",
+    "./engine": "./src/L9/engine.js",
+    "./verify": "./src/L10/verify.js"
+  },
+  "files": ["src", "cli", "tools", "examples", "bench", "docs"],
+  "engines": { "node": ">=20.0.0" },
+  "scripts": {
+    "verify": "node cli/forge.mjs verify",
+    "test": "node --test \"test/*.test.js\"",
+    "bench": "node cli/forge.mjs bench",
+    "demo": "node examples/01-quickstart.mjs",
+    "demo:quant": "node examples/02-quantize.mjs",
+    "demo:train": "node examples/03-train-and-generate.mjs",
+    "chat": "node cli/forge.mjs chat"
+  },
+  "keywords": ["llm", "gguf", "llama", "inference", "quantization", "flashattention", "javascript", "zero-dependency"],
+  "author": "晨星 (Chenxing)",
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "git+https://github.com/CJX0712/forge-llm.git" }
+}
