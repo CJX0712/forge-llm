@@ -107,6 +107,7 @@ forge-llm/
 ├── examples/                  01 快速上手 / 02 量化 / 03 训练闭环
 ├── test/                      59 个 node:test 用例（含 CLI 冒烟）
 ├── tools/quantize-gguf.mjs    GGUF 量化器
+├── tools/interop/             GGUF 外部证伪（官方 gguf-py + 独立 numpy 对照）
 ├── docs/                      架构 / 算法 / 性能 / 引用
 ├── install.sh / install.ps1   一键安装与验证
 ├── LICENSE                    Apache-2.0
@@ -155,7 +156,29 @@ I-90  GGUF 导出→重加载 输出逐位一致      maxLogitsDiff = 0.00e+0
 | Q6_K | 6.5625 | 4.88× | 1.24e-2 | 0.999848 |
 | Q4_K | 4.5 | 7.11× | 5.45e-2 | 0.997079 |
 
-### 4. 作为库使用
+### 4. GGUF 互操作：外部证伪（不是自证）
+
+不变量是**自洽性**检验——写端与读端同时犯同一个错时，它们依然全绿。
+所以本项目另设一条**外部证据链**：用第三方实现给 forge 挑错。
+
+| 环节 | 外部锚点 | 结果 |
+|---|---|---|
+| ① 权重来源 | llama.cpp 官方 `gguf-py` 的 `GGUFWriter`（不经 forge 之手） | 21 张量 / 434 KB |
+| ② 读官方文件 | forge `loadGGUF` → 独立 **numpy** 前向复算，逐点对拍 | embed / afterAttn / afterFFN / xFinal / logits 全 ≤ **1.7e-07** |
+| ③ 出厂前向 | `Transformer.forward`（+KVCache + gatherKV）vs numpy 参考 logits | max&#124;Δ&#124; = **3.149e-07**，argmax 一致 |
+| ④ **反向**闭环 | forge **写**出的 GGUF → 官方 `GGUFReader` 读回，逐张量比 dims + sha256 | 20/20 张量 **逐位一致** |
+
+```bash
+node tools/interop/run_interop.mjs --force     # 一键跑完 7 步，退出码 0 = 全 PASS
+```
+
+详见 [`tools/interop/README.md`](tools/interop/README.md)。
+
+> 这层检查**已实证抓到两个真实缺陷**：GGUF 字符串长度前缀宽度写错（导致 forge 导出的
+> GGUF 此前 llama.cpp **完全读不了**，官方 reader 直接崩溃），以及一处参照实现自身的
+> numpy 视图别名 bug（曾一度误判为 forge 发散）。详见 interop README 的「教训」一节。
+
+### 5. 作为库使用
 
 ```js
 import { loadGGUF, generate, sample, dequantize } from "forge-llm";
@@ -175,6 +198,7 @@ console.log(generate(model, { prompt: "你好", maxTokens: 64, min_p: 0.05 }));
 | 代码精简无冗余 | ✅ | 零依赖、零构建；3,453 行源码覆盖训练+量化+推理全栈（+852 行 CLI/示例/基准） |
 | 文档齐全 | ✅ | 架构 / 算法原理 / 模块职责 / 使用方式 / 性能对比 / 引用来源 六份文档 |
 | 他人可一键复现 | ✅ | `install.sh` / `install.ps1`；`verify` 全绿即证明环境正确 |
+| **格式与数学可被外部证伪** | ✅ | 官方 `gguf-py` 双向互操作 + 独立 numpy 前向对拍，max&#124;Δlogits&#124; = 3.15e-07（`tools/interop/`） |
 
 ---
 

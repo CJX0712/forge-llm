@@ -55,6 +55,28 @@ Standing on the shoulders of giants 的完整清单。
 | 「可证伪」的不变量测试法 | 性质测试 / metamorphic testing 思想 | L10 把每条数学性质变成可执行断言（38 项） |
 | Apache 2.0 许可证 | Apache Software Foundation | 项目许可，署名晨星 |
 
+## 外部证伪（interop falsification）
+
+自洽性检验有结构性盲区：**写端与读端同时犯同一个错时，往返测试必然全绿**。
+因此本项目另建一条以第三方实现为锚点的外部证据链（见 `tools/interop/README.md`）：
+
+| 外部锚点 | 来源 | 用法 | 实测结论 |
+|---|---|---|---|
+| `gguf-py` 的 `GGUFWriter` | llama.cpp / ggml 官方仓库 | 产出**未经 forge 之手**的权重文件 | 21 张量 / 434 KB，官方命名 |
+| `gguf-py` 的 `GGUFReader` | 同上 | 读回 **forge 写出的** GGUF，逐张量比 dims + sha256 | 20/20 张量逐位一致 |
+| 独立 numpy 前向 | 本项目自写，**不共享任何 forge 代码** | 复算同一套 RMSNorm / RoPE / GQA / 因果注意力 / SwiGLU | 出厂前向 logits max&#124;Δ&#124; = 3.149e-07 |
+
+**GGUF v3 规范要点**（本项目读写器严格遵循，见 ggml 官方 `docs/gguf.md`）：
+
+- `tensor_count` / `metadata_kv_count` 均为 **uint64**
+- 字符串 = **uint64** 长度前缀 + UTF-8 字节（含数组元素）
+- 张量 `dims` 按 **ggml 约定倒序存储**（numpy shape `[N,K]` → GGUF dims `[K,N]`）
+- 数据段按 `general.alignment`（默认 32）对齐，逐张量各自补齐
+
+> 这层检查已实证抓到两个真实缺陷：字符串长度前缀宽度写错（曾使 forge 导出的 GGUF
+> 被 llama.cpp **完全读不了**），以及参照实现自身的 numpy 视图别名 bug。
+> 两者在自洽性测试中都是全绿的——这正是外部证伪存在的理由。
+
 ## 与现有顶级方案的定位对比
 
 | 方案 | 语言/生态 | 与 forge-llm 的关系 |

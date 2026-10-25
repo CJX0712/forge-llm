@@ -461,8 +461,12 @@ export function runVerify(verbose = false) {
       maxDiff = Math.max(maxDiff, maxAbsErr(l0, lL));
     }
     check("I-90", "GGUF 导出→重加载 输出逐位一致", maxDiff < 1e-5, `maxLogitsDiff=${maxDiff.toExponential(2)}`);
-    // 元数据结构校验
-    check("I-91", "GGUF 元数据 architecture=torge", loaded.metadata.get("general.architecture") === "forge", `arch=${loaded.metadata.get("general.architecture")}`);
+    // 元数据结构校验：必须遵循 llama.cpp 官方命名（arch=llama + llama.* 键 + 官方张量名），
+    // 否则 llama.cpp / ollama / LM Studio 无法加载（forge.* 私有前缀只兼容旧版，不再生效）
+    const arch = loaded.metadata.get("general.architecture");
+    const officialKeys = loaded.metadata.has("llama.block_count") && loaded.metadata.has("llama.embedding_length");
+    check("I-91", "GGUF 元数据遵循官方命名 (arch=llama + llama.* 键)", arch === "llama" && officialKeys,
+      `arch=${arch} llama.*=${officialKeys}`);
   }
 
   // ── L8 采样 ──

@@ -33,7 +33,13 @@ class Reader {
   i32() { const v = this.dv.getInt32(this.p, true); this.p += 4; return v; }
   f32() { const v = this.dv.getFloat32(this.p, true); this.p += 4; return v; }
   u64() { const lo = this.dv.getUint32(this.p, true); const hi = this.dv.getUint32(this.p + 4, true); this.p += 8; return hi * 2 ** 32 + lo; }
-  str() { const n = this.u32(); const s = new TextDecoder().decode(this.buf.subarray(this.p, this.p + n)); this.p += n; return s; }
+  /**
+   * GGUF 字符串 = uint64 长度 + UTF-8 字节。
+   * 注意：官方规范是 **uint64**，不是 uint32。早期版本这里误写成 u32，
+   * 因为「自己写 u32、自己读 u32」而自洽，直到拿 llama.cpp 官方 gguf-py
+   * 产出的文件来读才暴露（直接越界崩溃）。互操作测试是唯一能抓到它的手段。
+   */
+  str() { const n = Number(this.u64()); const s = new TextDecoder().decode(this.buf.subarray(this.p, this.p + n)); this.p += n; return s; }
   sub(n) { const s = this.buf.subarray(this.p, this.p + n); this.p += n; return s; }
 }
 
@@ -48,7 +54,8 @@ class Writer {
   i32(v) { const a = new Uint8Array(4); new DataView(a.buffer).setInt32(0, v, true); this._push(a); }
   f32(v) { const a = new Uint8Array(4); new DataView(a.buffer).setFloat32(0, v, true); this._push(a); }
   u64(v) { const lo = v >>> 0; const hi = Math.floor(v / 2 ** 32) >>> 0; const a = new Uint8Array(8); new DataView(a.buffer).setUint32(0, lo, true); new DataView(a.buffer).setUint32(4, hi, true); this._push(a); }
-  str(s) { const b = new TextEncoder().encode(s); this.u32(b.length); this._push(b); }
+  /** GGUF 字符串 = uint64 长度 + UTF-8 字节（与官方规范一致） */
+  str(s) { const b = new TextEncoder().encode(s); this.u64(b.length); this._push(b); }
   raw(u8) { this._push(u8); }
   bytes() { return concat(this.chunks); }
   padTo(align) { while (this.p % align !== 0) this.u8(0); }
@@ -68,8 +75,10 @@ export function readGGUF(buf) {
   if (magic !== 0x46554747) throw new Error(`非法 GGUF magic: 0x${magic.toString(16)}`);
   const version = r.u32();
   if (version < 1 || version > 3) throw new Error(`不支持的 GGUF 版本: ${version}`);
-  const nTensors = r.u32();
-  const nKv = r.u32();
+  // 官方规范：tensor_count 与 metadata_kv_count 均为 uint64（同字符串长度一样，
+  // 早期误用 uint32 时因「自写自读」而自洽，读 llama.cpp 官方文件才暴露）
+  const nTensors = Number(r.u64());
+  const nKv = Number(r.u64());
   const meta = new Map();
   for (let i = 0; i < nKv; i++) {
     const key = r.str();
@@ -132,7 +141,7 @@ function readMetaValue(r, vt) {
 // ── 写 ─────────────────────────────────────────────────────────────────
 export function writeGGUF({ meta = new Map(), tensors = [] }) {
   const w = new Writer();
-  w.u32(0x46554747); w.u32(3); w.u32(tensors.length); w.u32(meta.size);
+  w.u32(0x46554747); w.u32(3); w.u64(tensors.length); w.u64(meta.size);
   // 元数据
   for (const [k, v] of meta) {
     w.str(k);
@@ -176,9 +185,8 @@ function encodeMetaValue(v) {
     const a = new Uint8Array(4); new DataView(a.buffer).setFloat32(0, v, true); return [GGUFValueType.FLOAT32, a];
   }
   if (typeof v === "string") {
-    // gguf-string：u32 长度前缀 + UTF-8 字节（数组元素同样适用）
-    const b = new TextEncoder().encode(v);
-    const w = new Writer(); w.u32(b.length); w.raw(b);
+    // gguf-string：u64 长度前缀 + UTF-8 字节（官方规范为 uint64；数组元素同样适用）
+    const w = new Writer(); w.str(v);
     return [GGUFValueType.STRING, w.bytes()];
   }
   if (Array.isArray(v)) {

@@ -188,7 +188,9 @@ test("CLI：export → inspect → quantize → chat 全链路", () => {
   assert.ok(existsSync(model) && statSync(model).size > 1000, "export 应产出 GGUF");
 
   const info = forge(["inspect", model]);
-  assert.match(info, /forge.block_count/);
+  // 导出遵循 llama.cpp 官方命名：general.architecture=llama + llama.* 键
+  assert.match(info, /general\.architecture/);
+  assert.match(info, /llama\.block_count/);
   assert.match(info, /token_embd/);
 
   const q = forge(["quantize", model, qmodel, "--type", "8"]);

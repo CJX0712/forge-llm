@@ -23,11 +23,19 @@ import {
 import { quantizeRow, rowBytes, info } from "../L3/quant.js";
 
 // ── 张量名约定（与 llama.cpp 兼容风格）────────────────────────────────────
+/**
+ * 张量命名 —— 与 llama.cpp 官方 GGUF 完全一致（blk.{l}.{name}.weight）。
+ * 注：官方把 Q/K/V 存成三个独立张量（attn_q/attn_k/attn_v），而内核内部
+ * 用融合的 wqkv 一次投影（少两次 GEMM 调用开销）。导出时拆开、加载时拼回。
+ */
 const T = {
   emb: "token_embd.weight",
   lnF: "output_norm.weight",
   ln1: (l) => `blk.${l}.attn_norm.weight`,
-  wqkv: (l) => `blk.${l}.attn_qkv.weight`,
+  wq: (l) => `blk.${l}.attn_q.weight`,
+  wk: (l) => `blk.${l}.attn_k.weight`,
+  wv: (l) => `blk.${l}.attn_v.weight`,
+  wqkv: (l) => `blk.${l}.attn_qkv.weight`, // 非官方别名：加载旧文件时兼容
   wo: (l) => `blk.${l}.attn_output.weight`,
   ln2: (l) => `blk.${l}.ffn_norm.weight`,
   fg: (l) => `blk.${l}.ffn_gate.weight`,
@@ -35,6 +43,34 @@ const T = {
   fd: (l) => `blk.${l}.ffn_down.weight`,
   out: "output.weight",
 };
+
+/**
+ * 官方 GGUF 的 dims 是**反转**的：numpy shape (N,K) → GGUF dims [K,N]
+ * （ggml 的 ne[] 按列优先语义）。实测：官方 gguf-py 写 (3,5) 得 dims [5,3]。
+ * 所以逻辑 [N(out),K(in)] 与 GGUF dims 的换算只有这一处，读写共用。
+ */
+const toGGUFDims = (N, K) => [K, N];
+const fromGGUFDims = (dims) => (dims.length >= 2 ? [dims[1], dims[0]] : [dims[0], 1]);
+
+/** 从（可能已量化的）矩阵字节里切出 [rowStart, rowStart+rowCount) 行 */
+function sliceRows(type, data, K, rowStart, rowCount) {
+  const rb = rowBytes(type, K);
+  return data.subarray(rowStart * rb, (rowStart + rowCount) * rb);
+}
+
+/** 把 q/k/v 三个张量按行拼成融合的 wqkv 字节（要求三者 type 与 K 相同） */
+function concatRows(parts, K) {
+  const types = new Set(parts.map((p) => p.type));
+  if (types.size !== 1) throw new Error(`Q/K/V 量化类型不一致: ${[...types]}`);
+  const type = parts[0].type;
+  const rb = rowBytes(type, K);
+  let total = 0;
+  for (const p of parts) total += p.data.byteLength;
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) { out.set(p.data, o); o += p.data.byteLength; }
+  return { type, data: out, rows: total / rb };
+}
 
 // ── 从 f32 权重构造 QuantLinear ─────────────────────────────────────────
 function wm(tensor, N, K, quantType) {
@@ -82,32 +118,48 @@ export function toTransformer(weights, config, quantType = 0) {
  * @param vocab    可选 GGUFVocab；用于写入 tokenizer 段
  * @param quantType 对线性权重采用的量化类型（默认 0=f32）
  */
+/**
+ * 导出为标准 llama 架构 GGUF —— 与 llama.cpp 官方命名/键名/维度约定一致，
+ * 可被 llama.cpp、ollama、LM Studio 等生态直接加载。
+ * @param quantType 0=f32，8=Q8_0，12=Q4_K，14=Q6_K …
+ */
 export function exportGGUF(weights, config, vocab = null, quantType = 0, name = "forge-model") {
   const c = config instanceof Config ? config : new Config(config);
+  const A = "llama"; // 官方架构名
   const meta = new Map();
-  meta.set("general.architecture", "forge");
+  meta.set("general.architecture", A);
   meta.set("general.name", name);
   meta.set("general.quantization_version", 2);
   meta.set("general.alignment", 32);
-  meta.set("forge.block_count", c.nLayers);
-  meta.set("forge.embedding_length", c.dim);
-  meta.set("forge.feed_forward_length", c.hidden);
-  meta.set("forge.attention.head_count", c.nHeads);
-  meta.set("forge.attention.head_count_kv", c.nKvHeads);
-  meta.set("forge.context_length", c.maxSeq);
-  meta.set("forge.attention.layer_norm_rms_epsilon", c.normEps);
-  meta.set("forge.vocab_size", c.vocabSize);
-  meta.set("forge.rope.freq_base", c.ropeTheta);
+  meta.set(`${A}.block_count`, c.nLayers);
+  meta.set(`${A}.embedding_length`, c.dim);
+  meta.set(`${A}.feed_forward_length`, c.hidden);
+  meta.set(`${A}.attention.head_count`, c.nHeads);
+  meta.set(`${A}.attention.head_count_kv`, c.nKvHeads);
+  meta.set(`${A}.context_length`, c.maxSeq);
+  meta.set(`${A}.attention.layer_norm_rms_epsilon`, c.normEps);
+  meta.set(`${A}.vocab_size`, c.vocabSize);
+  meta.set(`${A}.rope.freq_base`, c.ropeTheta);
+  meta.set("general.file_type", quantType ?? 0);
 
   const tensors = [];
   const pushT = (name, mat, N, K) => {
     const type = quantType ?? 0;
     if (type === 0) {
       const f32 = mat instanceof Float32Array ? mat : Float32Array.from(mat);
-      tensors.push({ name, dims: [N, K], type: 0, data: new Uint8Array(f32.buffer, f32.byteOffset, f32.byteLength) });
+      tensors.push({
+        name, dims: toGGUFDims(N, K), type: 0,
+        data: new Uint8Array(f32.buffer, f32.byteOffset, f32.byteLength),
+      });
     } else {
-      const bytes = quantizeRow(type, mat, N * K);
-      tensors.push({ name, dims: [N, K], type, data: bytes });
+      // 块量化要求行长是 blockSize 的整数倍，否则该张量降级为 f32
+      const t = info(type);
+      if (K % t.blockSize === 0) {
+        tensors.push({ name, dims: toGGUFDims(N, K), type, data: quantizeRow(type, mat, N * K) });
+      } else {
+        const f32 = mat instanceof Float32Array ? mat : Float32Array.from(mat);
+        tensors.push({ name, dims: toGGUFDims(N, K), type: 0, data: new Uint8Array(f32.buffer, f32.byteOffset, f32.byteLength) });
+      }
     }
   };
   const pushN = (name, vec, dim) => {
@@ -117,10 +169,33 @@ export function exportGGUF(weights, config, vocab = null, quantType = 0, name = 
 
   pushT(T.emb, weights.tok_emb, c.vocabSize, c.dim);
   pushN(T.lnF, weights.ln_f, c.dim);
+  const qD = c.nHeads * c.dHead, kvD = c.nKvHeads * c.dHead;
   for (let l = 0; l < c.nLayers; l++) {
     const L = weights[`layer.${l}`];
     pushN(T.ln1(l), L.ln1, c.dim);
-    pushT(T.wqkv(l), L.wqkv, c.qkvOut, c.dim);
+    // 内部融合 wqkv → 官方三个独立张量（按行切片，量化数据零反量化）
+    const type = quantType ?? 0;
+    const wqkv = L.wqkv instanceof Float32Array ? L.wqkv : Float32Array.from(L.wqkv);
+    if (type === 0) {
+      pushT(T.wq(l), wqkv.subarray(0, qD * c.dim), qD, c.dim);
+      pushT(T.wk(l), wqkv.subarray(qD * c.dim, (qD + kvD) * c.dim), kvD, c.dim);
+      pushT(T.wv(l), wqkv.subarray((qD + kvD) * c.dim, (qD + 2 * kvD) * c.dim), kvD, c.dim);
+    } else {
+      const t = info(type);
+      if (c.dim % t.blockSize === 0) {
+        const bytes = quantizeRow(type, wqkv, c.qkvOut * c.dim);
+        const push = (name, rowStart, rows) => tensors.push({
+          name, dims: toGGUFDims(rows, c.dim), type, data: sliceRows(type, bytes, c.dim, rowStart, rows),
+        });
+        push(T.wq(l), 0, qD);
+        push(T.wk(l), qD, kvD);
+        push(T.wv(l), qD + kvD, kvD);
+      } else {
+        pushT(T.wq(l), wqkv.subarray(0, qD * c.dim), qD, c.dim);
+        pushT(T.wk(l), wqkv.subarray(qD * c.dim, (qD + kvD) * c.dim), kvD, c.dim);
+        pushT(T.wv(l), wqkv.subarray((qD + kvD) * c.dim, (qD + 2 * kvD) * c.dim), kvD, c.dim);
+      }
+    }
     pushT(T.wo(l), L.wo, c.dim, c.dim);
     pushN(T.ln2(l), L.ln2, c.dim);
     pushT(T.fg(l), L.ffn_gate, c.hidden, c.dim);
@@ -146,38 +221,65 @@ export function exportGGUF(weights, config, vocab = null, quantType = 0, name = 
 }
 
 // ── 加载 GGUF → 可推理模型 ────────────────────────────────────────────────
+/**
+ * 加载 GGUF —— 按 llama.cpp 官方规范解析。
+ * 架构前缀取自 `general.architecture`（llama / qwen2 / gemma / mistral…），
+ * 元数据键为 `<arch>.*`，张量名为 `blk.{l}.*`；Q/K/V 三个独立张量会被
+ * 按行拼回内核内部的融合 wqkv。
+ */
 export function loadGGUF(buf) {
   const g = readGGUF(buf);
   const M = (k, d) => (g.meta.has(k) ? g.meta.get(k) : d);
+  const A = M("general.architecture", "llama");
+  const K = (suffix) => `${A}.${suffix}`;
   const config = new Config({
-    dim: M("forge.embedding_length"),
-    hidden: M("forge.feed_forward_length"),
-    nLayers: M("forge.block_count"),
-    nHeads: M("forge.attention.head_count"),
-    nKvHeads: M("forge.attention.head_count_kv"),
-    vocabSize: M("forge.vocab_size"),
-    maxSeq: M("forge.context_length"),
-    normEps: M("forge.attention.layer_norm_rms_epsilon"),
-    ropeTheta: M("forge.rope.freq_base", 10000),
+    dim: M(K("embedding_length")),
+    hidden: M(K("feed_forward_length")),
+    nLayers: M(K("block_count")),
+    nHeads: M(K("attention.head_count")),
+    nKvHeads: M(K("attention.head_count_kv"), M(K("attention.head_count"))),
+    vocabSize: M(K("vocab_size")),
+    maxSeq: M(K("context_length"), 512),
+    normEps: M(K("attention.layer_norm_rms_epsilon"), 1e-5),
+    ropeTheta: M(K("rope.freq_base"), 10000),
     bosId: M("tokenizer.ggml.bos_token_id", 1),
     eosId: M("tokenizer.ggml.eos_token_id", 2),
   });
+  const c = config;
 
   const gt = (name) => g.getTensor(name);
-  const w = {
-    tok_emb: tensorToQL(gt(T.emb), config.vocabSize, config.dim),
-    ln_f: tensorToF32(gt(T.lnF), config.dim),
-    wcls: gt(T.out) ? tensorToQL(gt(T.out), config.vocabSize, config.dim) : null,
+  /** 取矩阵张量：GGUF dims 是反转的，用 fromGGUFDims 还原 [N,K] */
+  const matQL = (name) => {
+    const t = gt(name);
+    if (!t) throw new Error(`缺失张量: ${name}`);
+    const [N, K2] = fromGGUFDims(t.dims);
+    return tensorToQL(t, N, K2);
   };
-  for (let l = 0; l < config.nLayers; l++) {
+  // Q/K/V：官方三张量 → 融合 wqkv（字节级按行拼接，量化数据不反量化）
+  const fuseQKV = (l) => {
+    const one = gt(T.wqkv(l));
+    if (one) return matQL(T.wqkv(l));
+    const q = gt(T.wq(l)), k = gt(T.wk(l)), v = gt(T.wv(l));
+    if (!q || !k || !v) throw new Error(`第 ${l} 层缺少 attn_q/k/v`);
+    const [, KQ] = fromGGUFDims(q.dims);
+    const fused = concatRows([q, k, v], KQ);
+    return tensorToQL(fused, c.qkvOut, KQ);
+  };
+
+  const w = {
+    tok_emb: matQL(T.emb),
+    ln_f: tensorToF32(gt(T.lnF), c.dim),
+    wcls: gt(T.out) ? matQL(T.out) : null,
+  };
+  for (let l = 0; l < c.nLayers; l++) {
     w[`layer.${l}`] = {
-      ln1: tensorToF32(gt(T.ln1(l)), config.dim),
-      ln2: tensorToF32(gt(T.ln2(l)), config.dim),
-      wqkv: tensorToQL(gt(T.wqkv(l)), config.qkvOut, config.dim),
-      wo: tensorToQL(gt(T.wo(l)), config.dim, config.dim),
-      ffn_gate: tensorToQL(gt(T.fg(l)), config.hidden, config.dim),
-      ffn_up: tensorToQL(gt(T.fu(l)), config.hidden, config.dim),
-      ffn_down: tensorToQL(gt(T.fd(l)), config.dim, config.hidden),
+      ln1: tensorToF32(gt(T.ln1(l)), c.dim),
+      ln2: tensorToF32(gt(T.ln2(l)), c.dim),
+      wqkv: fuseQKV(l),
+      wo: matQL(T.wo(l)),
+      ffn_gate: matQL(T.fg(l)),
+      ffn_up: matQL(T.fu(l)),
+      ffn_down: matQL(T.fd(l)),
     };
   }
 

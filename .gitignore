@@ -4,6 +4,9 @@ out/
 *.gguf.json
 bench.json
 
+# 外部参考仓库（llama.cpp 等，按需 clone，不入库）
+.ref/
+
 # Node
 node_modules/
 npm-debug.log*
