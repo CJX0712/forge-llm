@@ -159,7 +159,7 @@ test("L10 验证层：全部不变量通过", () => {
   const r = runVerify(false);
   const failed = r.results.filter((x) => !x.pass);
   assert.equal(failed.length, 0, `失败项: ${failed.map((x) => `${x.id} ${x.name} (${x.detail})`).join("; ")}`);
-  assert.ok(r.pass >= 38, `pass=${r.pass}`);
+  assert.ok(r.pass >= 40, `pass=${r.pass}`);
 });
 
 // ── CLI 冒烟测试 ─────────────────────────────────────────────────────
@@ -176,7 +176,7 @@ const CLI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "cl
 const forge = (argv) => execFileSync(process.execPath, [CLI, ...argv], { encoding: "utf8", stdio: "pipe" });
 
 test("CLI：verify / help / bench 子集", () => {
-  assert.match(forge(["verify"]), /38 通过/);
+  assert.match(forge(["verify"]), /40 通过/);
   assert.match(forge(["--help"]), /命令/);
 });
 

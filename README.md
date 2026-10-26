@@ -16,8 +16,8 @@ forge-llm 不是一个「能跑」的 demo，而是一个「可被证伪」的 L
 | 维度 | 主流方案 | forge-llm |
 |---|---|---|
 | 运行时 | Python + PyTorch（GB 级依赖） | 纯 JS，**零依赖零构建**，Node ≥ 20 |
-| 正确性保障 | 靠 CI 跑测试 | **38 条数学不变量**直接断言数学性质（梯度=中心差分、softmax Σ=1、RoPE 相对性、量化误差界、GGUF 字节级往返…） |
-| 量化 | 依赖 llama.cpp / AWQ / GPTQ | **自带** Q4_K/Q5_K/Q6_K/Q8_0/F16 编解码，位布局**逐位对齐** llama.cpp `ggml-quants.c` |
+| 正确性保障 | 靠 CI 跑测试 | **40 条数学不变量**直接断言数学性质（梯度=中心差分、softmax Σ=1、RoPE 相对性、量化误差界、GGUF 字节级往返…） |
+| 量化 | 依赖 llama.cpp / AWQ / GPTQ | **自带** Q4_K/Q5_K/Q6_K/Q8_0/F16 编解码，位布局经 llama.cpp 官方反量化器**逐位验证**（max&#124;Δ&#124;=0；Q8_0/F16 与官方写入端逐字节一致） |
 | 模型格式 | 各自实现 | **GGUF v3 读写器**，可与 llama.cpp 互操作 |
 | 训练 | PyTorch | **自带反向模式 AD**（向量级 + 张量级融合算子），训练前向与推理前向**逐位一致** |
 | 可复现 | 依赖环境 | 固定 RNG 种子 + 纯函数 + 无隐藏状态 |
@@ -43,7 +43,7 @@ forge-llm 不是一个「能跑」的 demo，而是一个「可被证伪」的 L
 ```bash
 git clone https://github.com/CJX0712/forge-llm.git
 cd forge-llm
-node cli/forge.mjs verify          # 38 条不变量自检（应全部 ✅）
+node cli/forge.mjs verify          # 40 条不变量自检（应全部 ✅）
 node cli/forge.mjs bench           # 性能基准（B1–B6）
 node cli/forge.mjs train --steps 200 --out out/tiny.gguf
 node cli/forge.mjs chat out/tiny.gguf --prompt "the " --tokens 120
@@ -65,14 +65,14 @@ node cli/forge.mjs chat out/tiny.gguf --prompt "the " --tokens 120
 ## 十层架构
 
 ```
-L10  验证层   runVerify()          38 条不变量，失败即退出码非 0
+L10  验证层   runVerify()          40 条不变量，失败即退出码非 0
 L9   引擎层   loadGGUF / generate  GGUF v3 读写 + 自回归生成
 L8   采样层   temperature/top-k/top-p/min-p/贪心
 L7   分词层   CharTokenizer / GGUFVocab（字节回退）
 L6   模型层   Transformer（推理） + TrainableTransformer（训练）
 L5   注意力   两趟扫描(解码) / 在线 softmax / KV 缓存 / 分页 KV / GQA
 L4   组件层   QuantLinear（量化感知线性层）/ SwiGLU
-L3   量化层   Q4_K/Q5_K/Q6_K/Q8_0/F16 编解码（对齐 llama.cpp）
+L3   量化层   Q4_K/Q5_K/Q6_K/Q8_0/F16 编解码（对齐 llama.cpp，Q5_K 为官方 ref 移植）
 L2   自动微分 向量级 AD + 张量级融合算子 + Adam
 L1   特殊函数 softmax / RMSNorm / RoPE / SwiGLU / erf / fp16
 L0   数值内核 GEMM(4路展开) / matvec / xorshift128+ RNG
@@ -102,7 +102,7 @@ forge-llm/
 │   ├── L8/sampling.js         采样策略
 │   ├── L9/gguf.js             GGUF v3 读写
 │   ├── L9/engine.js           加载 / 导出 / 生成
-│   └── L10/verify.js          38 条不变量
+│   └── L10/verify.js          40 条不变量
 ├── bench/bench.mjs            B1–B6 性能基准
 ├── examples/                  01 快速上手 / 02 量化 / 03 训练闭环
 ├── test/                      59 个 node:test 用例（含 CLI 冒烟）
@@ -127,7 +127,7 @@ node cli/forge.mjs chat out/tiny-q4.gguf --prompt "the "     # 推理
 node cli/forge.mjs inspect out/tiny-q4.gguf                  # 查看元数据
 ```
 
-### 2. 38 条数学不变量（可执行）
+### 2. 40 条数学不变量（可执行）
 
 ```
 I-00  gemm 与朴素三重循环一致            relL2 = 0.00e+0
@@ -149,12 +149,18 @@ I-90  GGUF 导出→重加载 输出逐位一致      maxLogitsDiff = 0.00e+0
 
 ### 3. 量化内核对齐 llama.cpp
 
+（n=4096，N(0,1)，RNG 种子 1，`qualityReport` 实跑）
+
 | 格式 | bpw | 压缩比 | RMSE | 余弦 |
 |---|---|---|---|---|
-| F16 | 16 | 2.00× | 1.47e-4 | 1.000000 |
-| Q8_0 | 8.5 | 3.76× | 3.73e-3 | 0.999986 |
-| Q6_K | 6.5625 | 4.88× | 1.24e-2 | 0.999848 |
-| Q4_K | 4.5 | 7.11× | 5.45e-2 | 0.997079 |
+| F16 | 16 | 2.00× | 2.15e-4 | 1.000000 |
+| Q8_0 | 8.5 | 3.76× | 5.54e-3 | 0.999985 |
+| Q6_K | 6.5625 | 4.88× | 1.82e-2 | 0.999842 |
+| Q5_K | 5.5 | 5.82× | 3.69e-2 | 0.999349 |
+| Q4_K | 4.5 | 7.11× | 8.07e-2 | 0.996913 |
+
+Q5_K 是 llama.cpp `quantize_row_q5_K_ref` 的忠实移植（含 `make_qkx2_quants` 加权网格搜索），
+Q4_K 为自研闭式 min-max 版（格式兼容、质量略低）——两者的字节都已被官方反量化器验证可读。
 
 ### 4. GGUF 互操作：外部证伪（不是自证）
 
@@ -167,16 +173,20 @@ I-90  GGUF 导出→重加载 输出逐位一致      maxLogitsDiff = 0.00e+0
 | ② 读官方文件 | forge `loadGGUF` → 独立 **numpy** 前向复算，逐点对拍 | embed / afterAttn / afterFFN / xFinal / logits 全 ≤ **1.7e-07** |
 | ③ 出厂前向 | `Transformer.forward`（+KVCache + gatherKV）vs numpy 参考 logits | max&#124;Δ&#124; = **3.149e-07**，argmax 一致 |
 | ④ **反向**闭环 | forge **写**出的 GGUF → 官方 `GGUFReader` 读回，逐张量比 dims + sha256 | 20/20 张量 **逐位一致** |
+| ⑤ 量化位布局 | forge 量化出的字节 → 官方 `gguf.quants.dequantize` 读回，与 forge 反量化对拍 | 5/5 格式 max&#124;Δ&#124; = **0**；Q8_0/F16 与官方写入端**逐字节一致** |
 
 ```bash
-node tools/interop/run_interop.mjs --force     # 一键跑完 7 步，退出码 0 = 全 PASS
+node tools/interop/run_interop.mjs --force     # 一键跑完 8 步，退出码 0 = 全 PASS
 ```
 
 详见 [`tools/interop/README.md`](tools/interop/README.md)。
 
-> 这层检查**已实证抓到两个真实缺陷**：GGUF 字符串长度前缀宽度写错（导致 forge 导出的
-> GGUF 此前 llama.cpp **完全读不了**，官方 reader 直接崩溃），以及一处参照实现自身的
-> numpy 视图别名 bug（曾一度误判为 forge 发散）。详见 interop README 的「教训」一节。
+> 这层检查**已实证抓到三个真实缺陷**：
+> ① GGUF 字符串长度前缀宽度写错（导致 forge 导出的 GGUF 此前 llama.cpp **完全读不了**，
+> 官方 reader 直接崩溃）；② **Q6_K 的 super-block scale `d` 被放在块头**——Q4_K/Q5_K 的
+> `d` 在块首，Q6_K 却在块尾（`ql[128] qh[64] scales[16] d[2]`），写端读端同错所以自洽
+> 往返全绿，而 llama.cpp 读 forge 的 Q6_K 会读出 **2.3e8** 量级的垃圾；
+> ③ 一处参照实现自身的 numpy 视图别名 bug（曾一度误判为 forge 发散）。详见 interop README。
 
 ### 5. 作为库使用
 
@@ -206,7 +216,7 @@ console.log(generate(model, { prompt: "你好", maxTokens: 64, min_p: 0.05 }));
 
 | 方案 | 强项 | forge-llm 的差异化 |
 |---|---|---|
-| **llama.cpp** | C++ 极致性能、完整量化生态 | 性能不在一个量级；本项目胜在**可验证性**（38 条不变量）、**零依赖**、**自带训练闭环**、可作为 JS 侧的教学/测试基准 |
+| **llama.cpp** | C++ 极致性能、完整量化生态 | 性能不在一个量级；本项目胜在**可验证性**（40 条不变量）、**零依赖**、**自带训练闭环**、可作为 JS 侧的教学/测试基准 |
 | **PyTorch** | 训练/自动微分工业标准 | PyTorch 无法做「读 GGUF → 量化 → 推理」这件事的一体化轻量实现；本项目补上了这条链，且**训练前向与推理前向逐位一致**（I-70） |
 | **nanoGPT** | 极简可读的 LLM 训练 | 仅 PyTorch；本项目把同样的架构落到零依赖 JS，并额外提供量化与 GGUF 互操作 |
 | **ggml / gguf-py** | 格式与工具链的事实标准 | 本项目是**纯 JS 的等价实现**，位布局逐位对齐，可与 llama.cpp 互读 |

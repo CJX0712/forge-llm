@@ -12,6 +12,12 @@
  *    实测 RMSE 数据见 PERFORMANCE.md；如需极致质量请用 llama-quantize 产出。
  *  - `FP16_TABLE`：65536 项查表替代 Math.pow，把 fp16→fp32 从 ~40ns 降到 ~1ns。
  *
+ * 位布局坑（踩过，勿改回）：
+ *  - Q4_K / Q5_K 的 super-block 是 `d(2) dmin(2) scales(12) qs(128/160)`，d 在**块头**；
+ *  - Q6_K 却是 `ql(128) qh(64) scales(16) d(2)`，d 在**块尾**。
+ *    早期把 Q6_K 的 d 也放块头，写端读端同错 ⇒ 自洽往返全绿，而官方反量化读出 2.3e8 的垃圾。
+ *    由 `tools/interop/verify_quant.*` 与 `test/l3-l5.test.js` 双重锁死。
+ *
  * 不变量：
  *  I-20  Q8_0 量化误差界：|x̂−x| ≤ d/2 = amax/254
  *  I-21  K-quant 层级 scale 解码与 llama.cpp 逐位一致（golden 向量对拍）
@@ -158,12 +164,12 @@ export function dequantize(type, u8, n, out = new Float32Array(n), byteOff = 0) 
       }
       return out;
     }
-    case 14: { // Q6_K: d, ql[128], qh[64], scales[16]
+    case 14: { // Q6_K: ql[128], qh[64], scales[16], d —— d 在块尾（与 Q4_K/Q5_K 不同！）
       const nb = n >> 8;
       for (let b = 0; b < nb; b++) {
         const base = byteOff + b * 210;
-        const d = h2f(u8, base);
-        const qlB = base + 2, qhB = base + 130, scB = base + 194;
+        const d = h2f(u8, base + 208);
+        const qlB = base, qhB = base + 128, scB = base + 192;
         for (let n2 = 0; n2 < QK_K; n2 += 128) {
           const hB = n2 >> 2;   // qh 每 128 元素前进 32 字节
           const sB = n2 >> 4;   // scales 每 128 元素前进 8 字节
@@ -279,8 +285,8 @@ export function dotQ(type, u8, x, n, xOff = 0, byteOff = 0) {
       const T = fp16Table();
       for (let b = 0; b < nb; b++) {
         const base = byteOff + b * 210;
-        const d = T[u8[base] | (u8[base + 1] << 8)];
-        const qlB = base + 2, qhB = base + 130, scB = base + 194, xb = xOff + b * 256;
+        const d = T[u8[base + 208] | (u8[base + 209] << 8)];
+        const qlB = base, qhB = base + 128, scB = base + 192, xb = xOff + b * 256;
         for (let nn = 0; nn < QK_K; nn += 128) {
           const hB = nn >> 2, sB = nn >> 4, lb = (nn >> 1);
           for (let l = 0; l < 32; l++) {
@@ -304,7 +310,12 @@ export function dotQ(type, u8, x, n, xOff = 0, byteOff = 0) {
 }
 
 // ── 编码 ─────────────────────────────────────────────────────────────
-const rnd = Math.round;
+/**
+ * nearest_int —— 四舍五入，半值**远离零**，与 llama.cpp 的 nearest_int / C roundf 一致。
+ * 注意 JS 原生 Math.round(-0.5) === -0（向 +∞ 取整），与 C 语义不同；
+ * 量化里出现精确 .5 平局时会与官方产出相差 1 LSB，故不可直接用 Math.round。
+ */
+const rnd = (v) => (v < 0 ? -Math.round(-v) : Math.round(v));
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 
 export function quantizeRowF16(x, n, off = 0) {
@@ -342,26 +353,26 @@ export function quantizeRowQ6K(x, n, off = 0) {
       const a = Math.abs(s);
       if (a > maxAbs) { maxAbs = a; maxScale = s; }
     }
-    if (maxAbs < 1e-30) { b++; continue; }
+    if (maxAbs < 1e-30) continue; // 全零块：留零字节即可（d=0 ⇒ 反量化为 0）
     const iscale = -128 / maxScale, dh = fp32ToFp16(1 / iscale);
     const base = b * 210;
-    out[base] = dh & 0xff; out[base + 1] = dh >> 8;
-    for (let ib = 0; ib < 16; ib++) out[base + 194 + ib] = Math.min(127, rnd(iscale * scales[ib])) & 0xff;
+    // 布局：ql[128] @0 · qh[64] @128 · scales[16] @192 · d(fp16) @208
+    out[base + 208] = dh & 0xff; out[base + 209] = dh >> 8;
+    for (let ib = 0; ib < 16; ib++) out[base + 192 + ib] = Math.min(127, rnd(iscale * scales[ib])) & 0xff;
     const d = fp16ToFp32(dh);
     for (let j = 0; j < 16; j++) {
-      const dd = d * (out[base + 194 + j] << 24 >> 24);
+      const dd = d * (out[base + 192 + j] << 24 >> 24);
       if (!dd) { for (let ii = 0; ii < 16; ii++) L[j * 16 + ii] = 32; continue; }
       for (let ii = 0; ii < 16; ii++) L[j * 16 + ii] = clamp(rnd(x[off + b * 256 + j * 16 + ii] / dd), -32, 31) + 32;
     }
-    let p = base + 2;
     for (let j = 0; j < QK_K; j += 128) {
+      const p = base + (j >> 1); // ql：每 128 元素前进 64 字节
       for (let l = 0; l < 32; l++) {
         const q1 = L[j + l] & 0xF, q2 = L[j + l + 32] & 0xF, q3 = L[j + l + 64] & 0xF, q4 = L[j + l + 96] & 0xF;
         out[p + l] = q1 | (q3 << 4);
         out[p + l + 32] = q2 | (q4 << 4);
-        out[base + 130 + (j >> 2) + l] = (L[j + l] >> 4) | ((L[j + l + 32] >> 4) << 2) | ((L[j + l + 64] >> 4) << 4) | ((L[j + l + 96] >> 4) << 6);
+        out[base + 128 + (j >> 2) + l] = (L[j + l] >> 4) | ((L[j + l + 32] >> 4) << 2) | ((L[j + l + 64] >> 4) << 4) | ((L[j + l + 96] >> 4) << 6);
       }
-      p += 64;
     }
   }
   return out;
@@ -401,6 +412,133 @@ function makeQxQuants(n, nmax, x, xOff, L, lOff) {
 }
 
 /**
+ * make_qkx2_quants —— llama.cpp ggml-quants.c 逐行移植（无 importance matrix 分支）。
+ * 带权重的最小二乘网格搜索：在 iscale = (rmin + rdelta*is + nmax)/(max-min) 的
+ * nstep+1 个候选里，按加权平方误差挑最优 (scale, min)。Q5_K 官方 ref 即调用此函数
+ * （nmax=31, rmin=-0.5, rdelta=0.1, nstep=15, use_mad=false）。
+ * @param theMinOut 长度为 1 的 Float32Array，接收 -min（零分配输出）
+ */
+function makeQkx2Quants(n, nmax, x, xOff, weights, L, lOff, theMinOut, Laux, rmin, rdelta, nstep, useMad) {
+  let min = x[xOff], max = x[xOff];
+  let sumW = weights[0], sumX = weights[0] * x[xOff];
+  for (let i = 1; i < n; i++) {
+    const v = x[xOff + i];
+    if (v < min) min = v;
+    if (v > max) max = v;
+    const w = weights[i];
+    sumW += w; sumX += w * v;
+  }
+  if (min > 0) min = 0;
+  if (max === min) { for (let i = 0; i < n; i++) L[lOff + i] = 0; theMinOut[0] = -min; return 0; }
+  let iscale = nmax / (max - min);
+  let scale = 1 / iscale;
+  let best = 0;
+  for (let i = 0; i < n; i++) {
+    const l = clamp(rnd(iscale * (x[xOff + i] - min)), 0, nmax);
+    L[lOff + i] = l;
+    let diff = scale * l + min - x[xOff + i];
+    diff = useMad ? Math.abs(diff) : diff * diff;
+    best += weights[i] * diff;
+  }
+  if (nstep < 1) { theMinOut[0] = -min; return scale; }
+  for (let is = 0; is <= nstep; is++) {
+    iscale = (rmin + rdelta * is + nmax) / (max - min);
+    let sumL = 0, sumL2 = 0, sumXL = 0;
+    for (let i = 0; i < n; i++) {
+      const l = clamp(rnd(iscale * (x[xOff + i] - min)), 0, nmax);
+      Laux[i] = l;
+      const w = weights[i];
+      sumL += w * l; sumL2 += w * l * l; sumXL += w * l * x[xOff + i];
+    }
+    const D = sumW * sumL2 - sumL * sumL;
+    if (D > 0) {
+      let thisScale = (sumW * sumXL - sumX * sumL) / D;
+      let thisMin = (sumL2 * sumX - sumL * sumXL) / D;
+      if (thisMin > 0) { thisMin = 0; thisScale = sumXL / sumL2; }
+      let cur = 0;
+      for (let i = 0; i < n; i++) {
+        let diff = thisScale * Laux[i] + thisMin - x[xOff + i];
+        diff = useMad ? Math.abs(diff) : diff * diff;
+        cur += weights[i] * diff;
+      }
+      if (cur < best) {
+        for (let i = 0; i < n; i++) L[lOff + i] = Laux[i];
+        best = cur; scale = thisScale; min = thisMin;
+      }
+    }
+  }
+  theMinOut[0] = -min;
+  return scale;
+}
+
+/**
+ * Q5_K 写入端 —— 逐行对齐 llama.cpp `quantize_row_q5_K_ref`
+ * （ggml/src/ggml-quants.c；权重 w=av_x+|x|，nmax=31，5 位拆成 4 位 qs + 1 位 qh）。
+ * 与自研闭式的 Q4_K 不同，这里是官方算法的忠实移植，质量与 llama.cpp 同级。
+ * 布局：d(2) + dmin(2) + scales(12) + qh(32) + qs(128) = 176 B / 256 元素。
+ */
+export function quantizeRowQ5K(x, n, off = 0) {
+  const nb = n >> 8, out = new Uint8Array(nb * 176);
+  const L = new Uint8Array(QK_K), Laux = new Uint8Array(32), weights = new Float32Array(32);
+  const mins = new Float32Array(8), scales = new Float32Array(8), tm = new Float32Array(1);
+  const ls = new Uint8Array(8), lm = new Uint8Array(8);
+  for (let b = 0; b < nb; b++) {
+    const xb = off + b * 256;
+    let maxScale = 0, maxMin = 0;
+    for (let j = 0; j < 8; j++) {
+      let sumX2 = 0;
+      for (let l = 0; l < 32; l++) { const v = x[xb + j * 32 + l]; sumX2 += v * v; }
+      const avX = Math.sqrt(sumX2 / 32);
+      for (let l = 0; l < 32; l++) weights[l] = avX + Math.abs(x[xb + j * 32 + l]);
+      scales[j] = makeQkx2Quants(32, 31, x, xb + j * 32, weights, L, j * 32, tm, Laux, -0.5, 0.1, 15, false);
+      mins[j] = tm[0];
+      if (scales[j] > maxScale) maxScale = scales[j];
+      if (mins[j] > maxMin) maxMin = mins[j];
+    }
+    const invScale = maxScale > 0 ? 63 / maxScale : 0;
+    const invMin = maxMin > 0 ? 63 / maxMin : 0;
+    const base = b * 176;
+    for (let j = 0; j < 8; j++) {
+      ls[j] = Math.min(63, rnd(invScale * scales[j]));
+      lm[j] = Math.min(63, rnd(invMin * mins[j]));
+    }
+    for (let j = 0; j < 8; j++) {
+      if (j < 4) { out[base + 4 + j] = ls[j]; out[base + 4 + j + 4] = lm[j]; }
+      else {
+        out[base + 4 + j + 4] = (ls[j] & 0xF) | ((lm[j] & 0xF) << 4);
+        out[base + 4 + j - 4] |= ((ls[j] >> 4) << 6);
+        out[base + 4 + j] |= ((lm[j] >> 4) << 6);
+      }
+    }
+    const dh = fp32ToFp16(maxScale / 63), dhm = fp32ToFp16(maxMin / 63);
+    out[base] = dh & 0xff; out[base + 1] = dh >> 8;
+    out[base + 2] = dhm & 0xff; out[base + 3] = dhm >> 8;
+    const d = fp16ToFp32(dh), dmin = fp16ToFp32(dhm);
+    for (let j = 0; j < 8; j++) {
+      getScaleMinK4Into(j, out, base + 4, _sm);
+      const dd = d * _sm[0], dm = dmin * _sm[1];
+      if (!dd) continue;
+      for (let l = 0; l < 32; l++) {
+        const v = x[xb + j * 32 + l];
+        L[j * 32 + l] = clamp(rnd((v + dm) / dd), 0, 31);
+      }
+    }
+    let m1 = 1, m2 = 2;
+    for (let jj = 0; jj < QK_K; jj += 64) {
+      for (let l = 0; l < 32; l++) {
+        let l1 = L[jj + l];
+        if (l1 > 15) { l1 -= 16; out[base + 16 + l] |= m1; }
+        let l2 = L[jj + l + 32];
+        if (l2 > 15) { l2 -= 16; out[base + 16 + l] |= m2; }
+        out[base + 48 + (jj >> 1) + l] = l1 | (l2 << 4);
+      }
+      m1 <<= 2; m2 <<= 2;
+    }
+  }
+  return out;
+}
+
+/**
  * Q4_K 写入端（自研闭式版，格式与 llama.cpp 完全兼容）
  * 每 32 元素子块取 min/max → 15 级均匀量化；8 个子块的 scale/min 再 6-bit
  * 量化到 super-block 的 d/dmin。省去了 importance-matrix 校准与迭代搜索，
@@ -414,9 +552,12 @@ export function quantizeRowQ4K(x, n, off = 0) {
     for (let j = 0; j < 8; j++) {
       let mn = Infinity, mx = -Infinity;
       for (let l = 0; l < 32; l++) { const v = x[off + b * 256 + j * 32 + l]; if (v < mn) mn = v; if (v > mx) mx = v; }
-      scales[j] = (mx - mn) / 15; mins[j] = mn;
+      // llama.cpp 的 make_qx_* 一律 `if (min > 0) min = 0`：min 为正会让反量化
+      // 的 `-dmin*m` 项把整个子块翻到负值域（全正子块 0.75 → -0.75）。
+      if (mn > 0) mn = 0;
+      scales[j] = (mx - mn) / 15; mins[j] = -mn; // mins[j] ≥ 0
       if (scales[j] > maxScale) maxScale = scales[j];
-      if (Math.abs(mins[j]) > maxMin) maxMin = Math.abs(mins[j]);
+      if (mins[j] > maxMin) maxMin = mins[j];
     }
     const d = maxScale / 63, dm = maxMin / 63;
     const base = b * 144;
@@ -456,6 +597,7 @@ export function quantizeRow(type, x, n, off = 0) {
     case 1: return quantizeRowF16(x, n, off);
     case 8: return quantizeRowQ8_0(x, n, off);
     case 12: return quantizeRowQ4K(x, n, off);
+    case 13: return quantizeRowQ5K(x, n, off);
     case 14: return quantizeRowQ6K(x, n, off);
     default: throw new Error(`quantizeRow 未实现类型 ${type}`);
   }

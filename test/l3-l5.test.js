@@ -6,8 +6,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   dequantize, quantizeRow, dotQ, rowBytes, info, qualityReport,
-  TYPE_INFO, GGMLType, quantizeRowQ4K, quantizeRowQ6K, quantizeRowQ8_0, quantizeRowF16,
+  TYPE_INFO, GGMLType, quantizeRowQ4K, quantizeRowQ5K, quantizeRowQ6K, quantizeRowQ8_0, quantizeRowF16,
 } from "../src/L3/quant.js";
+import { fp16ToFp32 } from "../src/L1/special.js";
 import { QuantLinear, SwiGLU } from "../src/L4/nn.js";
 import { attentionNaive, flashAttention, KVCache, PagedKVCache } from "../src/L5/attention.js";
 import { RNG, dot, maxAbsErr, cosSim } from "../src/L0/numeric.js";
@@ -61,13 +62,53 @@ test("dotQ 与「反量化后点积」一致（无中间物化）", () => {
   const rng = new RNG(3);
   const x = new Float32Array(n), y = new Float32Array(n);
   for (let i = 0; i < n; i++) { x[i] = rng.normal() * 0.8; y[i] = rng.normal(); }
-  for (const t of [GGMLType.F16, GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q6_K]) {
+  for (const t of [GGMLType.F16, GGMLType.Q8_0, GGMLType.Q4_K, GGMLType.Q5_K, GGMLType.Q6_K]) {
     const q = quantizeRow(t, x, n);
     const dq = dequantize(t, q, n);
     const a = dot(dq, y, n);
     const b = dotQ(t, q, y, n);
     assert.ok(Math.abs(a - b) <= 1e-3 * (Math.abs(a) + 1), `${info(t).name}: ${a} vs ${b}`);
   }
+});
+
+test("Q5_K 写入端：字节数 / 往返误差 / 5 位取值域", () => {
+  const n = 256, rng = new RNG(7);
+  const x = new Float32Array(n);
+  for (let i = 0; i < n; i++) x[i] = rng.normal() * 0.5;
+  const q = quantizeRowQ5K(x, n);
+  assert.equal(q.length, 176);
+  assert.equal(quantizeRow(GGMLType.Q5_K, x, n).length, 176);
+  const dq = dequantize(GGMLType.Q5_K, q, n);
+  let se = 0, sx = 0;
+  for (let i = 0; i < n; i++) { se += (dq[i] - x[i]) ** 2; sx += x[i] ** 2; }
+  const rel = Math.sqrt(se / sx);
+  assert.ok(rel < 0.05, `Q5_K 相对 RMSE=${rel}`);
+  // 5 位：qs 低 4 位 + qh 第 5 位；qh 的 32 字节必须被用到（否则等于退化成 Q4_K）
+  let qhUsed = 0;
+  for (let i = 0; i < 32; i++) if (q[16 + i] !== 0) qhUsed++;
+  assert.ok(qhUsed > 0, "qh 全零 ⇒ 第 5 位未写入");
+});
+
+test("Q6_K 位布局：super-block 的 d 在块尾（ql/qh/scales 与整体缩放无关）", () => {
+  // 判据：K-quant 的 ql/qh/scales 对正标量缩放不变，只有 d 随缩放线性变化。
+  // 若把 d 误放在块头（Q4_K/Q5_K 的写法），缩放后变化的就会是前两字节而非末两字节。
+  const n = 256, rng = new RNG(8);
+  const x = new Float32Array(n);
+  for (let i = 0; i < n; i++) x[i] = rng.normal();
+  const y = new Float32Array(n);
+  for (let i = 0; i < n; i++) y[i] = x[i] * 4;
+  const qx = quantizeRowQ6K(x, n), qy = quantizeRowQ6K(y, n);
+  assert.equal(qx.length, 210);
+  let headSame = true, tailDiff = false;
+  for (let b = 0; b < n / 256; b++) {
+    for (let i = 0; i < 208; i++) if (qx[b * 210 + i] !== qy[b * 210 + i]) headSame = false;
+    if (qx[b * 210 + 208] !== qy[b * 210 + 208] || qx[b * 210 + 209] !== qy[b * 210 + 209]) tailDiff = true;
+  }
+  assert.ok(headSame, "ql/qh/scales（块内前 208 字节）应随整体缩放不变");
+  assert.ok(tailDiff, "d（块尾 2 字节）应随整体缩放变化");
+  const dx = fp16ToFp32(qx[208] | (qx[209] << 8));
+  const dy = fp16ToFp32(qy[208] | (qy[209] << 8));
+  assert.ok(Math.abs(dy / dx - 4) < 0.02, `d 应线性随缩放：${dy} / ${dx} = ${dy / dx}`);
 });
 
 test("量化质量报告：压缩比与余弦", () => {

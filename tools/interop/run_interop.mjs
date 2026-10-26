@@ -7,6 +7,8 @@
  *   4. verify_engine.mjs —— forge「出厂代码路径」前向（用于证明发布代码正确）
  *   5. cmp_full.py       —— 逐阶段对拍（embed/afterAttn/afterFFN/xFinal/logits）
  *   6. cmp_logits.py     —— 出厂前向 vs numpy 参考的 logits 对拍
+ *   7. verify_export.*    —— 反向闭环：forge 写出的 GGUF 由官方 GGUFReader 读回
+ *   8. verify_quant.*    —— 量化位布局：forge 量化字节由官方 dequantize 读回
  *   7. 反向闭环          —— forge 写出的 GGUF 由 llama.cpp 官方 gguf-py 读回并逐张量比对
  *                           （prove「写」侧也符合官方格式，而非只「读」侧兼容）
  *
@@ -76,7 +78,7 @@ if (!existsSync(join(GGUFPY, "gguf", "gguf_writer.py"))) {
 log(`gguf-py: ${GGUFPY}`);
 
 // ── 1) 官方 GGUF ───────────────────────────────────────────────────────
-hr("1/7 生成官方 GGUF（llama.cpp 官方工具链）");
+hr("1/8 生成官方 GGUF（llama.cpp 官方工具链）");
 if (!FORCE && existsSync(GGUF) && existsSync(NPZ)) {
   log(`复用已有 ${GGUF}（${statSync(GGUF).size} 字节）；加 --force 可重建`);
 } else {
@@ -86,34 +88,34 @@ if (!FORCE && existsSync(GGUF) && existsSync(NPZ)) {
 }
 
 // ── 2) numpy 参考 ──────────────────────────────────────────────────────
-hr("2/7 独立 numpy 参考前向");
+hr("2/8 独立 numpy 参考前向");
 if (!run(py.cmd, [...py.args, "tools/interop/numpy_forward.py", "tools/interop/out/llama-official.gguf.npz",
   "--ids", "2,3,4,5", "--out", "tools/interop/out/np-logits.json"])) {
   log("\x1b[31mnumpy 参考前向失败\x1b[0m"); process.exit(1);
 }
 
 // ── 3) forge 逐阶段 dump ───────────────────────────────────────────────
-hr("3/7 forge 逐阶段中间量");
+hr("3/8 forge 逐阶段中间量");
 if (!run(process.execPath, ["tools/interop/dump_stages.mjs"])) {
   log("\x1b[31m逐阶段 dump 失败\x1b[0m"); process.exit(1);
 }
 
 // ── 4) forge 出厂前向 ──────────────────────────────────────────────────
-hr("4/7 forge 出厂代码路径前向（Transformer.forward + KVCache）");
+hr("4/8 forge 出厂代码路径前向（Transformer.forward + KVCache）");
 if (!run(process.execPath, ["tools/interop/verify_engine.mjs"])) {
   log("\x1b[31m出厂前向失败\x1b[0m"); process.exit(1);
 }
 
 // ── 5) 逐阶段对拍 ──────────────────────────────────────────────────────
-hr("5/7 逐阶段对拍");
+hr("5/8 逐阶段对拍");
 const okFull = run(py.cmd, [...py.args, "tools/interop/cmp_full.py"]);
 
 // ── 6) logits 对拍 ─────────────────────────────────────────────────────
-hr("6/7 logits 对拍");
+hr("6/8 logits 对拍");
 const okLogits = run(py.cmd, [...py.args, "tools/interop/cmp_logits.py"]);
 
 // ── 7) 反向闭环：forge 写 → 官方 gguf-py 读 ────────────────────────────
-hr("7/7 反向互操作（forge 写出的 GGUF 由官方 gguf-py 读回）");
+hr("7/8 反向互操作（forge 写出的 GGUF 由官方 gguf-py 读回）");
 let okExport = false;
 if (run(process.execPath, ["cli/forge.mjs", "export", "tools/interop/out/forge-export.gguf",
   "--dim", "64", "--layers", "2", "--vocab", "256"])) {
@@ -122,12 +124,21 @@ if (run(process.execPath, ["cli/forge.mjs", "export", "tools/interop/out/forge-e
   }
 }
 
+// ── 8) 量化位布局：forge 量化 → 官方 gguf-py 反量化 ────────────────────
+hr("8/8 量化位布局对拍（官方 dequantize 读 forge 字节）");
+let okQuant = false;
+if (run(process.execPath, ["tools/interop/verify_quant.mjs"])) {
+  okQuant = run(py.cmd, [...py.args, "tools/interop/verify_quant.py"]);
+}
+
 hr("结论");
-if (okFull && okLogits && okExport) {
-  log("\x1b[32m\x1b[1m全部 PASS ✅\x1b[0m  forge-llm 的 GGUF 读写与前向数学与 llama.cpp 生态一致（≤1e-5）");
+const all = okFull && okLogits && okExport && okQuant;
+if (all) {
+  log("\x1b[32m\x1b[1m全部 PASS ✅\x1b[0m  forge-llm 的 GGUF 读写、前向数学与量化位布局与 llama.cpp 生态一致");
   process.exit(0);
 }
 log("\x1b[31m\x1b[1m存在失败项 ❌\x1b[0m  逐阶段: " + (okFull ? "PASS" : "FAIL")
   + " / logits: " + (okLogits ? "PASS" : "FAIL")
-  + " / 反向互操作: " + (okExport ? "PASS" : "FAIL"));
+  + " / 反向互操作: " + (okExport ? "PASS" : "FAIL")
+  + " / 量化布局: " + (okQuant ? "PASS" : "FAIL"));
 process.exit(1);

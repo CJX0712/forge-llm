@@ -329,11 +329,11 @@ export function runVerify(verbose = false) {
   {
     const N = 1024;
     const x = new Float32Array(N); for (let i = 0; i < N; i++) x[i] = rng.normal() * 0.7;
-    for (const [tname, t] of [["Q8_0", 8], ["Q4_K", 12], ["Q6_K", 14]]) {
+    for (const [tname, t] of [["Q8_0", 8], ["Q4_K", 12], ["Q5_K", 13], ["Q6_K", 14]]) {
       const q = quantizeRow(t, x, N);
       const dq = dequantize(t, q, N);
       const rmseV = Math.sqrt(dq.reduce((a, b, i) => a + (b - x[i]) ** 2, 0) / N);
-      const ok = { 8: 0.02, 12: 0.06, 14: 0.02 }[t];
+      const ok = { 8: 0.02, 12: 0.06, 13: 0.04, 14: 0.02 }[t];
       check(`I-20+${tname}`, `${tname} 反量化 RMSE 在界内`, rmseV < ok, `RMSE=${rmseV.toExponential(2)} (界 ${ok})`);
 
       // dotQ vs 反量化后 dot
@@ -343,8 +343,9 @@ export function runVerify(verbose = false) {
       check(`I-22+${tname}`, `${tname} dotQ 与反量化点积一致`, Math.abs(qd - dqDot) < 1e-3 * (Math.abs(dqDot) + 1), `Δ=${Math.abs(qd - dqDot).toExponential(2)}`);
     }
     // bpw 表
-    const bpwOK = info(12).bpw === 4.5 && info(14).bpw === 6.5625 && info(8).bpw === 8.5;
-    check("I-23", "bit-per-weight 与官方一致", bpwOK, `Q4_K=${info(12).bpw} Q6_K=${info(14).bpw} Q8_0=${info(8).bpw}`);
+    const bpwOK = info(12).bpw === 4.5 && info(13).bpw === 5.5 && info(14).bpw === 6.5625 && info(8).bpw === 8.5;
+    check("I-23", "bit-per-weight 与官方一致", bpwOK,
+      `Q4_K=${info(12).bpw} Q5_K=${info(13).bpw} Q6_K=${info(14).bpw} Q8_0=${info(8).bpw}`);
   }
 
   // ── L4 组件 ──

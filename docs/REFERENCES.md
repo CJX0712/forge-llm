@@ -26,7 +26,8 @@ Standing on the shoulders of giants 的完整清单。
 | 组件 | 来源 | 本项目如何复用 |
 |---|---|---|
 | GGUF 容器格式 | ggerganov/llama.cpp, `gguf-py/gguf/constants.py` 与 `ggml/include/ggml.h` | 元数据键值、张量对齐（默认 32）、`ggml_type` 枚举与块大小，逐一对齐 |
-| Q4_K / Q5_K / Q6_K / Q8_0 位布局 | llama.cpp `src/ggml-quants.c`（`quantize_row_q4_K_ref` / `dequantize_row_q4_K` 等） | super-block 256、12 字节 6-bit scales（`get_scale_min_k4` 的两种编码分支）、fp16 d/dmin、q4  nibble + qh 高位 —— 按官方参考实现逐行对齐 |
+| Q4_K / Q5_K / Q6_K / Q8_0 位布局 | llama.cpp `ggml/src/ggml-quants.c`（`quantize_row_q4_K_ref` / `dequantize_row_q4_K` 等） | super-block 256、12 字节 6-bit scales（`get_scale_min_k4` 的两种编码分支）、fp16 d/dmin、qs nibble + qh 高位 —— 按官方参考实现逐行对齐 |
+| Q5_K 写入端算法 | llama.cpp `ggml/src/ggml-quants.c` 的 `quantize_row_q5_K_ref` + `make_qkx2_quants`（rmin=-0.5, rdelta=0.1, nstep=15, use_mad=false，权重 `av_x+\|x\|`） | 逐行移植为 `quantizeRowQ5K` / `makeQkx2Quants`；5 位拆成 qs 低 4 位 + qh 第 5 位 |
 | Q8_0 | 同上（`quantize_row_q8_0_ref`） | fp16 d + 32×int8，块长 32 |
 | fp16 ↔ fp32 | IEEE 754-2008 half precision | 65536 项查表（含 subnormal 分支），避免逐次转换开销 |
 
